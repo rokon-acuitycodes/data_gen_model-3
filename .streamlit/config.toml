@@ -1,0 +1,24 @@
+[server]
+# Essential for Modal deployment
+headless = true
+port = 8000
+address = "0.0.0.0"
+
+# CORS settings - ENABLE for Modal proxy
+enableCORS = true
+enableXsrfProtection = false
+enableWebsocketCompression = false
+
+# File upload settings
+maxUploadSize = 200
+maxMessageSize = 200
+
+# Base URL path (empty for root)
+baseUrlPath = ""
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Prevent file watcher issues in containerized environment
+fastReruns = false

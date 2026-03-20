@@ -1,0 +1,67 @@
+# Modal ignore file — prevents these files from being uploaded to Modal
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+env/
+.venv/
+venv.bak/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Large data, datasets, model weights and checkpoints
+data/
+datasets/
+models/
+checkpoints/
+weights/
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+*.h5
+*.bin
+
+# Archives and large binaries
+*.tar
+*.tar.gz
+*.zip
+
+# Secrets and keys
+
+
+secrets/
+*.pem
+*.key
+
+# Git and editor metadata
+.git/
+# Sometimes Git writes to FETCH_HEAD during background operations; ignore it explicitly
+.git/FETCH_HEAD
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+*.tmp
+*.swp

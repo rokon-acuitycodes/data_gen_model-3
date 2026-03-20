@@ -1,0 +1,40 @@
+# Combined requirements for Unified Data & Image Generator
+
+# Web UI Framework
+streamlit>=1.28.0
+
+# Image processing
+pillow>=9.0.0
+
+# Data processing
+pandas>=1.5.0
+openpyxl>=3.1.0
+
+# Machine Learning & NLP
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+diffusers>=0.21.0
+
+# Document processing
+python-docx>=0.8.11
+pypdf>=3.0.0
+reportlab>=4.0.0
+
+# Data generation
+faker>=15.0.0
+
+# Text processing
+sentencepiece>=0.1.99
+
+# AWS S3 Integration
+boto3>=1.26.0
+
+# Additional utilities
+numpy>=1.24.0
+scipy>=1.10.0
+
+openai
+python-dotenv
+
+modal
