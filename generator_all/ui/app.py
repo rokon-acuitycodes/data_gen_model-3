@@ -112,6 +112,12 @@ def images_to_zip_bytes(images: List[Any]) -> bytes:
             zip_file.writestr(f"image_{i+1}.png", img_byte_arr.getvalue())
     return zip_buffer.getvalue()
 
+def pil_image_to_png_bytes(img: Any) -> bytes:
+    """Convert a PIL Image to PNG bytes for S3 upload / inline base64."""
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format="PNG")
+    return img_byte_arr.getvalue()
+
 
 def files_to_zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
     """Zip (filename, bytes) pairs into an in-memory ZIP."""
@@ -132,6 +138,11 @@ def _content_type_for_ext(file_ext: str) -> str:
     if file_ext == "pdf":
         return "application/pdf"
     return "application/octet-stream"
+
+
+def make_data_uri(content_type: str, b64: str) -> str:
+    """Create a `data:` URI string for UI rendering when S3 is not configured."""
+    return f"data:{content_type};base64,{b64}"
 
 
 @app.get("/health")
@@ -198,15 +209,51 @@ async def generate_image_from_file(
 
     s3_manager = get_s3_manager()
     zip_stem = Path(file.filename).stem if file.filename else "uploaded_image"
+    image_items: List[Dict[str, Any]] = []
 
     if s3_manager:
+        # Upload zip for bulk download (keeps backward-compat behavior)
         image_files = [(f"image_{i+1}.png", img) for i, img in enumerate(generated_images)]
         download_url = s3_manager.upload_images_and_zip(
             images=image_files,
             zip_name=f"generated_images_{zip_stem}",
         )
+
+        # Also upload each image individually so UI can render one-by-one.
+        for i, img in enumerate(generated_images):
+            variation = variations[i] if i < len(variations) else ""
+            png_bytes = pil_image_to_png_bytes(img)
+            image_url = s3_manager.upload_file(
+                file_data=png_bytes,
+                filename=f"image_{i+1}.png",
+                content_type="image/png",
+            )
+            image_items.append(
+                {
+                    "image_index": i + 1,
+                    "variation": variation,
+                    # UI-friendly alias
+                    "file_url": image_url,
+                }
+            )
     else:
         download_url = None
+        # Fallback: embed per-image base64 for one-by-one UI rendering.
+        for i, img in enumerate(generated_images):
+            variation = variations[i] if i < len(variations) else ""
+            png_bytes = pil_image_to_png_bytes(img)
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+            image_items.append(
+                {
+                    "image_index": i + 1,
+                    "variation": variation,
+                    "image_base64": b64,
+                    # UI-friendly alias (so `src` can be set directly)
+                    "file_url": make_data_uri("image/png", b64),
+                }
+            )
+
+
 
     if mode == "zip":
         return StreamingResponse(
@@ -221,7 +268,9 @@ async def generate_image_from_file(
             "caption": caption,
             "variations": variations,
             "images_count": len(generated_images),
-            "download_url": download_url,
+            # ZIP download URL (bundle)
+            "zip_download_url": download_url,
+            "image_results": image_items,
         }
 
     return JSONResponse(
@@ -231,6 +280,7 @@ async def generate_image_from_file(
             "variations": variations,
             "images_count": len(generated_images),
             "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
+            "image_results": image_items,
         }
     )
 
@@ -286,6 +336,7 @@ async def generate_data_from_file(
     zip_stem = Path(file.filename).stem if file.filename else "uploaded_file"
 
     download_url = None
+    file_items: List[Dict[str, Any]] = []
     if s3_manager:
         files_for_s3: List[Tuple[str, bytes, str]] = []
         for filename, data in result_data:
@@ -294,6 +345,35 @@ async def generate_data_from_file(
             files=files_for_s3,
             zip_name=f"generated_{file_ext}_{zip_stem}",
         )
+
+        # Also upload each file individually so UI can render one-by-one.
+        for filename, data in result_data:
+            file_url = s3_manager.upload_file(
+                file_data=data,
+                filename=filename,
+                content_type=_content_type_for_ext(file_ext),
+            )
+            file_items.append(
+                {
+                    "filename": filename,
+                    "size_bytes": len(data),
+                    # UI-friendly alias
+                    "file_url": file_url,
+                }
+            )
+    else:
+        # Fallback: embed file bytes base64 for one-by-one UI rendering.
+        for filename, data in result_data:
+            b64 = base64.b64encode(data).decode("utf-8")
+            file_items.append(
+                {
+                    "filename": filename,
+                    "size_bytes": len(data),
+                    "file_base64": b64,
+                    # UI-friendly alias (data URI)
+                    "file_url": make_data_uri(_content_type_for_ext(file_ext), b64),
+                }
+            )
 
     if mode == "zip":
         return StreamingResponse(
@@ -309,7 +389,8 @@ async def generate_data_from_file(
             "mode": "json",
             "file_type": file_ext,
             "files": file_summaries,
-            "download_url": download_url,
+            "zip_download_url": download_url,
+            "file_results": file_items,
         }
 
     return JSONResponse(
@@ -318,6 +399,7 @@ async def generate_data_from_file(
             "file_type": file_ext,
             "files": file_summaries,
             "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
+            "file_results": file_items,
         }
     )
 
