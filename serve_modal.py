@@ -8,7 +8,9 @@ vol = modal.Volume.from_name("my-volume", create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "streamlit>=1.35.0",
+        "fastapi>=0.110.0",
+        "uvicorn[standard]>=0.27.0",
+        "python-multipart>=0.0.9",
         "pandas",
         "numpy",
         "requests",
@@ -58,28 +60,14 @@ app = modal.App("unified-generator-app", image=image)
     secrets=[modal.Secret.from_name("aws-credentials")]
 )
 @modal.web_server(8000)
-def run_streamlit():
+def run_fastapi():
     import subprocess
     import os
-    import sys
     import shlex
     
-    # Change to project directory so Streamlit can find .streamlit/config.toml
+    # Change to project directory so the FastAPI module import works
     os.chdir("/root/project")
-    
-    app_path = "generator_all/ui/app.py"
-    target = shlex.quote(app_path)
-    
-    # Comprehensive flags to fix Modal proxy + Streamlit upload issues
-    cmd = (
-        f"streamlit run {target} "
-        f"--server.port 8000 "
-        f"--server.address 0.0.0.0 "
-        f"--server.enableCORS false "
-        f"--server.enableXsrfProtection false "
-        f"--server.enableWebsocketCompression false "
-        f"--server.headless true "
-        f"--browser.gatherUsageStats false "
-        f"--server.fileWatcherType none"
-    )
+
+    # Start FastAPI (OpenAPI will be available at /docs)
+    cmd = "uvicorn generator_all.ui.app:app --host 0.0.0.0 --port 8000 --log-level info"
     subprocess.Popen(cmd, shell=True)

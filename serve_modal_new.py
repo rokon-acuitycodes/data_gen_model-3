@@ -8,7 +8,9 @@ vol = modal.Volume.from_name("my-volume", create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "streamlit>=1.35.0",
+        "fastapi>=0.110.0",
+        "uvicorn[standard]>=0.27.0",
+        "python-multipart>=0.0.9",
         "pandas",
         "numpy",
         "requests",
@@ -59,33 +61,28 @@ app = modal.App("unified-generator-app", image=image)
     min_containers=0,
     max_containers=1,
     scaledown_window=60,
-    container_idle_timeout=60,
 )
 @modal.web_server(8000)
 @modal.concurrent(max_inputs=100)
 def web():
-    target = "/root/project/generator_all/ui/app.py"
+    import os
 
-    # Start Streamlit and don't wait - Modal will keep container alive
+    # Critical: set working directory so `generator_all` is importable.
+    os.chdir("/root/project")
+    # Ensure python can import local packages when uvicorn starts.
+    os.environ.setdefault("PYTHONPATH", "/root/project:/root/project/src")
+
+    # Start FastAPI and don't wait - Modal will keep container alive
     subprocess.Popen(
         [
-            "streamlit",
-            "run",
-            target,
-            "--server.port",
-            "8000",
-            "--server.address",
+            "uvicorn",
+            "generator_all.ui.app:app",
+            "--host",
             "0.0.0.0",
-            "--server.headless",
-            "true",
-            "--server.enableCORS",
-            "false",
-            "--server.enableXsrfProtection",
-            "false",
-            "--browser.gatherUsageStats",
-            "false",
-            "--server.fileWatcherType",
-            "none",
+            "--port",
+            "8000",
+            "--log-level",
+            "info",
         ]
     )
 

@@ -24,7 +24,9 @@ image = (
     
     # 2. PYTHON DEPENDECIES (PIP)
     .pip_install(
-        "streamlit>=1.35.0",
+        "fastapi>=0.110.0",
+        "uvicorn[standard]>=0.27.0",
+        "python-multipart>=0.0.9",
         "pandas",
         "numpy",
         "requests",
@@ -168,19 +170,9 @@ def run():
         subprocess.run("ls -R /root/project", shell=True)
         return
 
-    # 3. Streamlit কমান্ড রেডি করা
-    target = shlex.quote(remote_app_path)
-    cmd = (
-        f"streamlit run {target} "
-        f"--server.port 8000 "
-        f"--server.address 0.0.0.0 "
-        f"--server.enableCORS=false "
-        f"--server.enableXsrfProtection=false "
-        f"--server.headless=true "
-        f"--server.fileWatcherType=none"
-    )
-    
-    print(f"🚀 Starting Streamlit: {cmd}")
+    # 3. FastAPI/uvicorn command
+    cmd = "uvicorn generator_all.ui.app:app --host 0.0.0.0 --port 8000 --log-level info"
+    print(f"🚀 Starting FastAPI: {cmd}")
     
     # 4. সার্ভার স্টার্ট করা
     subprocess.run(cmd, shell=True, check=True)
