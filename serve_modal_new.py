@@ -1,12 +1,15 @@
+import os
 import modal
 from pathlib import Path
 import subprocess
 
-vol = modal.Volume.from_name("my-volume", create_if_missing=True)
+# Define a volume for persisting Hugging Face models and other data
+vol = modal.Volume.from_name("unified-gen-volume", create_if_missing=True)
 
-# Define the image with dependencies
+# Define the image with all required dependencies for LTX-2.3 and traditional generators
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git", "libgl1", "libglib2.0-0") # Added for OpenCV/PIL dependencies
     .pip_install(
         "fastapi>=0.110.0",
         "uvicorn[standard]>=0.27.0",
@@ -17,9 +20,10 @@ image = (
         "pillow",
         "torch",
         "transformers",
-        "diffusers",
         "accelerate",
         "huggingface_hub",
+        "hf_transfer",     # 🔥 For high-speed downloads
+        "safetensors",      # 🔥 Required for many modern models
         "openpyxl",
         "python-docx",
         "pypdf>=3.0.0",
@@ -30,12 +34,11 @@ image = (
         "scipy>=1.10.0",
         "openai",
         "python-dotenv",
-        "websockets",
-        "httpx",
-        "starlette",
     )
+    # Ensure we use the latest diffusers (LTX-2.3 often requires dev branch)
+    .run_commands("pip install -U git+https://github.com/huggingface/diffusers.git")
     .add_local_dir(
-        Path(__file__).parent,  # Mount the entire project directory
+        Path(__file__).parent,
         remote_path="/root/project",
         ignore=[
             "__pycache__",
@@ -47,32 +50,40 @@ image = (
             "outputs",
         ],
     )
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1", # 🔥 Enable HF Transfer speedup
+        "PYTHONPATH": "/root/project:/root/project/src"
+    })
 )
 
 app = modal.App("unified-generator-app", image=image)
-
 
 @app.function(
     image=image,
     gpu="L4",
     timeout=1800,
-    volumes={"/media": vol},
-    secrets=[modal.Secret.from_name("aws-secret")],
+    # Mount volume for persistent model caching (HF_HOME)
+    volumes={"/cache": vol},
+    # Ensure you have these secrets created in your Modal dashboard
+    secrets=[
+        modal.Secret.from_name("aws-secret"),
+        modal.Secret.from_name("HF_TOKEN"), # 🔥 Added for gated models like LTX
+    ],
     min_containers=0,
     max_containers=1,
-    scaledown_window=60,
 )
 @modal.web_server(8000)
 @modal.concurrent(max_inputs=100)
 def web():
     import os
-
-    # Critical: set working directory so `generator_all` is importable.
+    
+    # Configure Hugging Face to use the persistent volume
+    os.environ["HF_HOME"] = "/cache/huggingface"
+    
+    # Critical: set working directory
     os.chdir("/root/project")
-    # Ensure python can import local packages when uvicorn starts.
-    os.environ.setdefault("PYTHONPATH", "/root/project:/root/project/src")
 
-    # Start FastAPI and don't wait - Modal will keep container alive
+    # Start FastAPI
     subprocess.Popen(
         [
             "uvicorn",
@@ -85,7 +96,6 @@ def web():
             "info",
         ]
     )
-
 
 if __name__ == "__main__":
     app.deploy()
