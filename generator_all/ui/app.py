@@ -102,6 +102,14 @@ def get_t5_model(device: str):
     return T5Model(device=device)
 
 
+@lru_cache(maxsize=1)
+def get_video_generator(device: str):
+    from generators.video_generator import VideoGenerator
+
+    return VideoGenerator(device)
+
+
+
 def images_to_zip_bytes(images: List[Any]) -> bytes:
     """Zip PIL Images into an in-memory ZIP (PNG format)."""
     zip_buffer = io.BytesIO()
@@ -456,6 +464,75 @@ async def generate_image_from_text(
             "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
         }
     )
+
+
+@app.post("/api/generate/video-from-image")
+async def generate_video_from_image(
+    file: UploadFile = File(...),
+    prompt: str = Form(..., description="Prompt describing the video to generate from the image."),
+    num_frames: int = Form(121, description="Number of frames (default 121, recommended 8N+1)"),
+    mode: Literal["json", "download"] = Query("json", description="Return JSON metadata or direct video download."),
+):
+    file_ext = _get_file_ext(file.filename or "")
+    if file_ext not in {"jpg", "jpeg", "png"}:
+        raise HTTPException(status_code=400, detail="Unsupported image format. Use jpg/jpeg/png.")
+        
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    from PIL import Image
+    import torch
+
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    # For LTX, dimensions should be standard 768x512
+    image = image.resize((768, 512), Image.Resampling.LANCZOS)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    with torch.no_grad():
+        vid_gen = get_video_generator(device)
+        video_bytes = vid_gen.generate_video(image, prompt, num_frames=num_frames)
+
+    if not video_bytes:
+        raise HTTPException(status_code=500, detail="Failed to generate video.")
+
+    s3_manager = get_s3_manager()
+    download_url = None
+    if s3_manager:
+        download_url = s3_manager.upload_file(
+            file_data=video_bytes,
+            filename="generated_video.mp4",
+            content_type="video/mp4"
+        )
+    
+    if mode == "download":
+        return StreamingResponse(
+            io.BytesIO(video_bytes),
+            media_type="video/mp4",
+            headers={"Content-Disposition": 'attachment; filename="generated_video.mp4"'},
+        )
+        
+    b64 = base64.b64encode(video_bytes).decode("utf-8")
+    
+    result_item = {
+        "video_base64": b64,
+        "file_url": make_data_uri("video/mp4", b64)
+    }
+    
+    if download_url:
+        result_item["file_url"] = download_url
+        
+    return JSONResponse({
+        "mode": "json",
+        "prompt": prompt,
+        "video_download_url": download_url,
+        "video_result": result_item
+    })
 
 
 if __name__ == "__main__":
