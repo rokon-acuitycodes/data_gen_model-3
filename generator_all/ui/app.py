@@ -28,12 +28,12 @@ sys.path.insert(0, utils_path)
 # HuggingFace cache location
 # ----------------------------
 if os.path.exists("d:/"):
-    os.environ["HF_HOME"] = "d:/huggingface_cache"
-    os.environ["TRANSFORMERS_CACHE"] = "d:/huggingface_cache/transformers"
+    os.environ.setdefault("HF_HOME", "d:/huggingface_cache")
+    os.environ.setdefault("TRANSFORMERS_CACHE", "d:/huggingface_cache/transformers")
 else:
-    # Modal/container environment
-    os.environ["HF_HOME"] = "/root/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/root/.cache/huggingface/transformers"
+    # Respect container-provided cache locations such as Modal volumes.
+    os.environ.setdefault("HF_HOME", "/root/.cache/huggingface")
+    os.environ.setdefault("TRANSFORMERS_CACHE", "/root/.cache/huggingface/transformers")
 
 
 app = FastAPI(
@@ -494,9 +494,23 @@ async def generate_video_from_image(
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with torch.no_grad():
-        vid_gen = get_video_generator(device)
-        video_bytes = vid_gen.generate_video(image, prompt, num_frames=num_frames)
+    try:
+        with torch.no_grad():
+            vid_gen = get_video_generator(device)
+            video_bytes = vid_gen.generate_video(image, prompt, num_frames=num_frames)
+    except torch.OutOfMemoryError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Video generation exceeded the available GPU memory on the current Modal worker.",
+        ) from exc
+    except RuntimeError as exc:
+        error_message = str(exc)
+        if "out of GPU memory" in error_message or "out of memory" in error_message:
+            raise HTTPException(
+                status_code=503,
+                detail=error_message,
+            ) from exc
+        raise
 
     if not video_bytes:
         raise HTTPException(status_code=500, detail="Failed to generate video.")
@@ -540,4 +554,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

@@ -1,15 +1,15 @@
 import os
-import modal
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
-# Define a volume for persisting Hugging Face models and other data
+import modal
+
+
 vol = modal.Volume.from_name("unified-gen-volume", create_if_missing=True)
 
-# Define the image with all required dependencies for LTX-2.3 and traditional generators
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "libgl1", "libglib2.0-0") # Added for OpenCV/PIL dependencies
+    .apt_install("git", "libgl1", "libglib2.0-0")
     .pip_install(
         "fastapi>=0.110.0",
         "uvicorn[standard]>=0.27.0",
@@ -19,11 +19,13 @@ image = (
         "requests",
         "pillow",
         "torch",
-        "transformers",
-        "accelerate",
-        "huggingface_hub",
-        "hf_transfer",     # 🔥 For high-speed downloads
-        "safetensors",      # 🔥 Required for many modern models
+        "transformers>=4.52.0",
+        "accelerate>=1.6.0",
+        "huggingface_hub>=0.31.0",
+        "hf_transfer",
+        "safetensors>=0.4.5",
+        "protobuf>=5.0.0",
+        "av>=12.0.0",
         "openpyxl",
         "python-docx",
         "pypdf>=3.0.0",
@@ -35,8 +37,24 @@ image = (
         "openai",
         "python-dotenv",
     )
-    # Ensure we use the latest diffusers (LTX-2.3 often requires dev branch)
-    .run_commands("pip install -U git+https://github.com/huggingface/diffusers.git")
+    .run_commands(
+        "pip install -U git+https://github.com/huggingface/diffusers.git transformers accelerate huggingface_hub safetensors protobuf av"
+    )
+    .env(
+        {
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "PYTHONPATH": "/root/project:/root/project/src",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "TOKENIZERS_PARALLELISM": "false",
+            "VIDEO_MODEL_ID": "Lightricks/LTX-2",
+            "VIDEO_INFERENCE_STEPS": "20",
+            "VIDEO_GUIDANCE_SCALE": "4.0",
+            "VIDEO_FRAME_RATE": "24.0",
+            "VIDEO_OFFLOAD_MODE": "sequential",
+            "VIDEO_MAX_SEQUENCE_LENGTH": "256",
+            "VIDEO_OOM_RETRY_MAX_SEQUENCE_LENGTH": "128",
+        }
+    )
     .add_local_dir(
         Path(__file__).parent,
         remote_path="/root/project",
@@ -50,40 +68,30 @@ image = (
             "outputs",
         ],
     )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1", # 🔥 Enable HF Transfer speedup
-        "PYTHONPATH": "/root/project:/root/project/src"
-    })
 )
 
 app = modal.App("unified-generator-app", image=image)
+
 
 @app.function(
     image=image,
     gpu="L4",
     timeout=1800,
-    # Mount volume for persistent model caching (HF_HOME)
     volumes={"/cache": vol},
-    # Ensure you have these secrets created in your Modal dashboard
     secrets=[
         modal.Secret.from_name("aws-secret"),
-        modal.Secret.from_name("HF_TOKEN"), # 🔥 Added for gated models like LTX
+        modal.Secret.from_name("HF_TOKEN"),
     ],
     min_containers=0,
     max_containers=1,
 )
 @modal.web_server(8000)
-@modal.concurrent(max_inputs=100)
+@modal.concurrent(max_inputs=1)
 def web():
-    import os
-    
-    # Configure Hugging Face to use the persistent volume
     os.environ["HF_HOME"] = "/cache/huggingface"
-    
-    # Critical: set working directory
+    os.environ["TRANSFORMERS_CACHE"] = "/cache/huggingface/transformers"
     os.chdir("/root/project")
 
-    # Start FastAPI
     subprocess.Popen(
         [
             "uvicorn",
@@ -96,6 +104,7 @@ def web():
             "info",
         ]
     )
+
 
 if __name__ == "__main__":
     app.deploy()
