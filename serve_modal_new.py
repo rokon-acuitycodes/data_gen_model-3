@@ -19,6 +19,7 @@ image = (
         "requests",
         "pillow",
         "torch",
+        "torchaudio",
         "transformers>=4.52.0",
         "accelerate>=1.6.0",
         "huggingface_hub>=0.31.0",
@@ -38,7 +39,7 @@ image = (
         "python-dotenv",
     )
     .run_commands(
-        "pip install -U git+https://github.com/huggingface/diffusers.git transformers accelerate huggingface_hub safetensors protobuf av"
+        "pip install -U git+https://github.com/huggingface/diffusers.git transformers accelerate huggingface_hub safetensors protobuf av torchaudio"
     )
     .env(
         {

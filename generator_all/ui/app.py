@@ -609,11 +609,13 @@ async def generate_image_from_text(
 @app.post("/api/generate/video-from-image")
 async def generate_video_from_image(
     file: UploadFile = File(...),
+    audio_file: Optional[UploadFile] = File(None, description="Optional audio file for lip-synced voice."),
     prompt: str = Form(..., description="Prompt describing the video to generate from the image."),
     num_frames: int = Form(121, description="Number of frames (default 121, recommended 8N+1)"),
     negative_prompt: str = Form("", description="Optional negative prompt to suppress artifacts or unwanted styles."),
     num_inference_steps: Optional[int] = Form(None, description="Inference steps for video generation."),
     guidance_scale: Optional[float] = Form(None, description="Prompt guidance strength for video generation."),
+    sync_to_audio_duration: bool = Form(True, description="When audio is provided, resize the video length to match the audio duration."),
     mode: Literal["json", "download"] = Query("json", description="Return JSON metadata or direct video download."),
 ):
     file_ext = _get_file_ext(file.filename or "")
@@ -627,6 +629,14 @@ async def generate_video_from_image(
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty upload.")
+
+    audio_contents = None
+    audio_filename = None
+    if audio_file is not None:
+        audio_contents = await audio_file.read()
+        if not audio_contents:
+            raise HTTPException(status_code=400, detail="Audio upload is empty.")
+        audio_filename = audio_file.filename or "audio.wav"
 
     from PIL import Image
     import torch
@@ -646,6 +656,9 @@ async def generate_video_from_image(
                 num_frames=num_frames,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                audio_bytes=audio_contents,
+                audio_filename=audio_filename,
+                sync_to_audio_duration=sync_to_audio_duration,
             )
     except torch.OutOfMemoryError as exc:
         raise HTTPException(

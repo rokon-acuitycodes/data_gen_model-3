@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import tempfile
 from threading import Lock
@@ -24,6 +25,7 @@ DEFAULT_STAGE2_NUM_INFERENCE_STEPS = 3
 DEFAULT_STAGE2_GUIDANCE_SCALE = 1.0
 DEFAULT_STAGE2_SCALE_FACTOR = 2
 DEFAULT_STAGE2_LORA_WEIGHT_NAME = "ltx-2-19b-distilled-lora-384.safetensors"
+DEFAULT_AUDIO_CUSTOM_PIPELINE = "linoyts/ltx2-audio-video-conditioning"
 DEFAULT_MAX_SEQUENCE_LENGTH = 256
 DEFAULT_OFFLOAD_MODE = "sequential"
 DEFAULT_OOM_RETRY_MAX_SEQUENCE_LENGTH = 128
@@ -77,6 +79,14 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _load_public_diffusion_pipeline(loader_cls, model_name, **kwargs):
+    load_kwargs = dict(kwargs)
+    try:
+        return loader_cls.from_pretrained(model_name, token=False, **load_kwargs)
+    except TypeError:
+        return loader_cls.from_pretrained(model_name, use_auth_token=False, **load_kwargs)
+
+
 class VideoGenerator:
     def __init__(self, device: Optional[str] = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,6 +113,10 @@ class VideoGenerator:
         self.stage2_lora_weight_name = os.getenv(
             "VIDEO_STAGE2_LORA_WEIGHT_NAME",
             DEFAULT_STAGE2_LORA_WEIGHT_NAME,
+        )
+        self.audio_custom_pipeline = os.getenv(
+            "VIDEO_AUDIO_CUSTOM_PIPELINE",
+            DEFAULT_AUDIO_CUSTOM_PIPELINE,
         )
         self.frame_rate = float(os.getenv("VIDEO_FRAME_RATE", str(DEFAULT_FRAME_RATE)))
         self.max_sequence_length = int(
@@ -174,6 +188,7 @@ class VideoGenerator:
         self._distilled_sigmas = DISTILLED_SIGMA_VALUES
         self._stage2_sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
         self._stage2_lora_loaded = False
+        self._audio_pipe = None
 
         print(f"Initializing VideoGenerator on {self.device}...")
         print(
@@ -227,6 +242,31 @@ class VideoGenerator:
         if hasattr(pipeline, "enable_vae_slicing"):
             pipeline.enable_vae_slicing()
 
+    def _get_audio_pipe(self):
+        if self._audio_pipe is not None:
+            return self._audio_pipe
+
+        try:
+            from diffusers import DiffusionPipeline
+        except ImportError as exc:
+            raise RuntimeError(
+                "Audio-conditioned video generation requires Diffusers DiffusionPipeline support."
+            ) from exc
+
+        print(
+            "Loading audio-conditioned LTX-2 pipeline "
+            f"from {self.model_id} with custom pipeline {self.audio_custom_pipeline}..."
+        )
+        torch_dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
+        self._audio_pipe = _load_public_diffusion_pipeline(
+            DiffusionPipeline,
+            self.model_id,
+            custom_pipeline=self.audio_custom_pipeline,
+            torch_dtype=torch_dtype,
+        )
+        self._prepare_pipeline_for_runtime(self._audio_pipe, prefer_model_offload=False)
+        return self._audio_pipe
+
     def _cleanup_cuda_memory(self):
         if not torch.cuda.is_available():
             return
@@ -274,6 +314,27 @@ class VideoGenerator:
             prompt_parts.append(self.default_realism_suffix)
 
         return ". ".join(part for part in prompt_parts if part).strip() + "."
+
+    def _estimate_num_frames_from_audio(self, audio_path: str, fallback_num_frames: int) -> int:
+        try:
+            import av
+
+            with av.open(audio_path) as container:
+                audio_stream = next(
+                    (stream for stream in container.streams if stream.type == "audio"),
+                    None,
+                )
+                if audio_stream and audio_stream.duration is not None and audio_stream.time_base is not None:
+                    duration_seconds = float(audio_stream.duration * audio_stream.time_base)
+                elif container.duration is not None:
+                    duration_seconds = float(container.duration / av.time_base)
+                else:
+                    return fallback_num_frames
+        except Exception:
+            return fallback_num_frames
+
+        estimated_frames = max(9, math.ceil(duration_seconds * self.frame_rate))
+        return ((estimated_frames - 1 + 7) // 8) * 8 + 1
 
     def _build_generator(self):
         if self.seed is None:
@@ -348,6 +409,45 @@ class VideoGenerator:
         if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
             call_kwargs["sigmas"] = self._distilled_sigmas
         return self.pipe(**call_kwargs)
+
+    def _run_audio_conditioned(
+        self,
+        *,
+        image: Any,
+        audio_path: str,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        num_frames: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        max_sequence_length: int,
+    ):
+        prepared_prompt = self._prepare_prompt(prompt)
+        generator = self._build_generator()
+        audio_pipe = self._get_audio_pipe()
+        call_kwargs = {
+            "image": image,
+            "audio": audio_path,
+            "prompt": prepared_prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": self.frame_rate,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "output_type": "np",
+            "return_dict": False,
+            "max_sequence_length": max_sequence_length,
+        }
+        if generator is not None:
+            call_kwargs["generator"] = generator
+        if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            call_kwargs["sigmas"] = self._distilled_sigmas
+
+        return audio_pipe(**call_kwargs)
 
     def _run_two_stage(
         self,
@@ -447,6 +547,9 @@ class VideoGenerator:
         num_frames: int = 121,
         num_inference_steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
+        audio_bytes: Optional[bytes] = None,
+        audio_filename: Optional[str] = None,
+        sync_to_audio_duration: bool = True,
     ) -> bytes:
         """Generate an MP4 video from a PIL image and prompt."""
         if (num_frames - 1) % 8 != 0:
@@ -464,11 +567,40 @@ class VideoGenerator:
             f"mode={self.pipeline_mode}..."
         )
 
+        audio_temp_path = None
         try:
             with self._lock:
                 self._cleanup_cuda_memory()
                 with torch.inference_mode():
-                    if self.use_two_stage:
+                    if audio_bytes:
+                        suffix = os.path.splitext(audio_filename or "audio.wav")[1] or ".wav"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as audio_file:
+                            audio_file.write(audio_bytes)
+                            audio_temp_path = audio_file.name
+
+                        if sync_to_audio_duration:
+                            num_frames = self._estimate_num_frames_from_audio(
+                                audio_temp_path,
+                                num_frames,
+                            )
+
+                        print(
+                            "Using audio-conditioned video generation for lip-sync "
+                            f"with {num_frames} frames."
+                        )
+                        video, audio = self._run_audio_conditioned(
+                            image=image,
+                            audio_path=audio_temp_path,
+                            prompt=prompt,
+                            negative_prompt=negative_prompt,
+                            width=width,
+                            height=height,
+                            num_frames=num_frames,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=guidance_scale,
+                            max_sequence_length=self.max_sequence_length,
+                        )
+                    elif self.use_two_stage:
                         video, audio = self._run_two_stage(
                             image=image,
                             prompt=prompt,
@@ -510,17 +642,31 @@ class VideoGenerator:
             try:
                 with self._lock:
                     with torch.inference_mode():
-                        video, audio = self._run_single_stage(
-                            image=image,
-                            prompt=prompt,
-                            negative_prompt=negative_prompt,
-                            width=width,
-                            height=height,
-                            num_frames=num_frames,
-                            num_inference_steps=num_inference_steps,
-                            guidance_scale=guidance_scale,
-                            max_sequence_length=retry_max_sequence_length,
-                        )
+                        if audio_bytes and audio_temp_path:
+                            video, audio = self._run_audio_conditioned(
+                                image=image,
+                                audio_path=audio_temp_path,
+                                prompt=prompt,
+                                negative_prompt=negative_prompt,
+                                width=width,
+                                height=height,
+                                num_frames=num_frames,
+                                num_inference_steps=num_inference_steps,
+                                guidance_scale=guidance_scale,
+                                max_sequence_length=retry_max_sequence_length,
+                            )
+                        else:
+                            video, audio = self._run_single_stage(
+                                image=image,
+                                prompt=prompt,
+                                negative_prompt=negative_prompt,
+                                width=width,
+                                height=height,
+                                num_frames=num_frames,
+                                num_inference_steps=num_inference_steps,
+                                guidance_scale=guidance_scale,
+                                max_sequence_length=retry_max_sequence_length,
+                            )
             except torch.OutOfMemoryError as retry_exc:
                 self._cleanup_cuda_memory()
                 raise RuntimeError(
@@ -556,5 +702,7 @@ class VideoGenerator:
                 self._set_stage2_adapter_weight(0.0)
                 self._restore_default_scheduler()
             self._cleanup_cuda_memory()
+            if audio_temp_path and os.path.exists(audio_temp_path):
+                os.remove(audio_temp_path)
             if temp_filepath and os.path.exists(temp_filepath):
                 os.remove(temp_filepath)

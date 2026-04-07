@@ -212,6 +212,15 @@ Form fields:
 - `mode=zip` returns binary ZIP stream (`application/zip`)
 - `mode=json` returns metadata + URLs/base64
 
+## Video Voice Sync
+
+`POST /api/generate/video-from-image` also accepts:
+
+- `audio_file` (optional)
+- `sync_to_audio_duration` (default `true`)
+
+When `audio_file` is provided, the video generator switches to an audio-conditioned LTX-2 pipeline for lip-sync and attempts to match the clip length to the audio duration.
+
 ## Common Notes
 
 - Large model initialization can take time on first run.
