@@ -153,6 +153,36 @@ def make_data_uri(content_type: str, b64: str) -> str:
     return f"data:{content_type};base64,{b64}"
 
 
+def prepare_video_condition_image(image: Any, target_width: int = 768, target_height: int = 512):
+    """Resize without stretching the source image, using a soft blurred background fill."""
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    background = ImageOps.fit(
+        image,
+        (target_width, target_height),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    background = background.filter(ImageFilter.GaussianBlur(radius=18))
+    background = ImageEnhance.Brightness(background).enhance(0.75)
+
+    foreground = ImageOps.contain(
+        image,
+        (target_width, target_height),
+        method=Image.Resampling.LANCZOS,
+    )
+
+    canvas = background.copy()
+    offset = (
+        (target_width - foreground.width) // 2,
+        (target_height - foreground.height) // 2,
+    )
+    canvas.paste(foreground, offset)
+    return canvas
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "device": _device()}
@@ -471,6 +501,9 @@ async def generate_video_from_image(
     file: UploadFile = File(...),
     prompt: str = Form(..., description="Prompt describing the video to generate from the image."),
     num_frames: int = Form(121, description="Number of frames (default 121, recommended 8N+1)"),
+    negative_prompt: str = Form("", description="Optional negative prompt to suppress artifacts or unwanted styles."),
+    num_inference_steps: Optional[int] = Form(None, description="Inference steps for video generation."),
+    guidance_scale: Optional[float] = Form(None, description="Prompt guidance strength for video generation."),
     mode: Literal["json", "download"] = Query("json", description="Return JSON metadata or direct video download."),
 ):
     file_ext = _get_file_ext(file.filename or "")
@@ -489,15 +522,21 @@ async def generate_video_from_image(
     import torch
 
     image = Image.open(io.BytesIO(contents)).convert("RGB")
-    # For LTX, dimensions should be standard 768x512
-    image = image.resize((768, 512), Image.Resampling.LANCZOS)
+    image = prepare_video_condition_image(image, target_width=768, target_height=512)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
         with torch.no_grad():
             vid_gen = get_video_generator(device)
-            video_bytes = vid_gen.generate_video(image, prompt, num_frames=num_frames)
+            video_bytes = vid_gen.generate_video(
+                image,
+                prompt,
+                negative_prompt=negative_prompt or None,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+            )
     except torch.OutOfMemoryError as exc:
         raise HTTPException(
             status_code=503,

@@ -7,27 +7,104 @@ from typing import Any, Optional
 import torch
 
 
-DEFAULT_VIDEO_MODEL_ID = "Lightricks/LTX-2"
-DEFAULT_NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
+DEFAULT_PIPELINE_MODE = "distilled_two_stage"
+DEFAULT_VIDEO_MODEL_ID = "rootonchair/LTX-2-19b-distilled"
+DEFAULT_VIDEO_BASE_MODEL_ID = "Lightricks/LTX-2"
+DEFAULT_NEGATIVE_PROMPT = (
+    "worst quality, blurry, soft focus, flicker, jitter, temporal inconsistency, warped motion, "
+    "deformed anatomy, duplicate limbs, extra fingers, distorted face, plastic skin, "
+    "cgi, cartoon, illustration, 3d render"
+)
 DEFAULT_FRAME_RATE = 24.0
-DEFAULT_NUM_INFERENCE_STEPS = 40
-DEFAULT_GUIDANCE_SCALE = 4.0
+DEFAULT_DISTILLED_NUM_INFERENCE_STEPS = 8
+DEFAULT_DISTILLED_GUIDANCE_SCALE = 1.0
+DEFAULT_DEV_NUM_INFERENCE_STEPS = 40
+DEFAULT_DEV_GUIDANCE_SCALE = 4.0
+DEFAULT_STAGE2_NUM_INFERENCE_STEPS = 3
+DEFAULT_STAGE2_GUIDANCE_SCALE = 1.0
+DEFAULT_STAGE2_SCALE_FACTOR = 2
+DEFAULT_STAGE2_LORA_WEIGHT_NAME = "ltx-2-19b-distilled-lora-384.safetensors"
 DEFAULT_MAX_SEQUENCE_LENGTH = 256
 DEFAULT_OFFLOAD_MODE = "sequential"
 DEFAULT_OOM_RETRY_MAX_SEQUENCE_LENGTH = 128
+DEFAULT_PROMPT_SUFFIX = (
+    "single continuous shot, coherent natural motion, stable identity, accurate anatomy, "
+    "clean subject separation, fine detail, realistic textures"
+)
+DEFAULT_REALISM_SUFFIX = (
+    "live-action footage, photorealistic, natural lighting, physically plausible materials, "
+    "subtle cinematic depth of field"
+)
+STYLIZED_PROMPT_MARKERS = (
+    "anime",
+    "animation",
+    "cartoon",
+    "comic",
+    "illustration",
+    "paint",
+    "painting",
+    "sketch",
+    "pixel art",
+    "claymation",
+    "stop motion",
+    "low poly",
+    "cgi",
+    "3d render",
+    "stylized",
+)
+CAMERA_PROMPT_MARKERS = (
+    "camera",
+    "close-up",
+    "medium shot",
+    "wide shot",
+    "tracking shot",
+    "dolly",
+    "pan",
+    "tilt",
+    "zoom",
+    "handheld",
+    "over-the-shoulder",
+)
+PIPELINE_MODE_SINGLE_STAGE = "single_stage"
+PIPELINE_MODE_DISTILLED_TWO_STAGE = "distilled_two_stage"
+PIPELINE_MODE_DEV_LORA_TWO_STAGE = "dev_lora_two_stage"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class VideoGenerator:
     def __init__(self, device: Optional[str] = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_id = os.getenv("VIDEO_MODEL_ID", DEFAULT_VIDEO_MODEL_ID)
+        self.pipeline_mode = os.getenv("VIDEO_PIPELINE_MODE", DEFAULT_PIPELINE_MODE).lower()
+        if self.pipeline_mode not in {
+            PIPELINE_MODE_SINGLE_STAGE,
+            PIPELINE_MODE_DISTILLED_TWO_STAGE,
+            PIPELINE_MODE_DEV_LORA_TWO_STAGE,
+        }:
+            self.pipeline_mode = DEFAULT_PIPELINE_MODE
+
+        self.base_model_id = os.getenv("VIDEO_BASE_MODEL_ID", DEFAULT_VIDEO_BASE_MODEL_ID)
+        default_model_id = (
+            self.base_model_id
+            if self.pipeline_mode == PIPELINE_MODE_DEV_LORA_TWO_STAGE
+            else DEFAULT_VIDEO_MODEL_ID
+        )
+        self.model_id = os.getenv("VIDEO_MODEL_ID", default_model_id)
+        self.latent_upsampler_model_id = os.getenv(
+            "VIDEO_LATENT_UPSAMPLER_MODEL_ID",
+            self.model_id if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE else self.base_model_id,
+        )
+        self.stage2_lora_repo_id = os.getenv("VIDEO_STAGE2_LORA_REPO_ID", self.base_model_id)
+        self.stage2_lora_weight_name = os.getenv(
+            "VIDEO_STAGE2_LORA_WEIGHT_NAME",
+            DEFAULT_STAGE2_LORA_WEIGHT_NAME,
+        )
         self.frame_rate = float(os.getenv("VIDEO_FRAME_RATE", str(DEFAULT_FRAME_RATE)))
-        self.default_num_inference_steps = int(
-            os.getenv("VIDEO_INFERENCE_STEPS", str(DEFAULT_NUM_INFERENCE_STEPS))
-        )
-        self.default_guidance_scale = float(
-            os.getenv("VIDEO_GUIDANCE_SCALE", str(DEFAULT_GUIDANCE_SCALE))
-        )
         self.max_sequence_length = int(
             os.getenv("VIDEO_MAX_SEQUENCE_LENGTH", str(DEFAULT_MAX_SEQUENCE_LENGTH))
         )
@@ -38,44 +115,117 @@ class VideoGenerator:
                 str(DEFAULT_OOM_RETRY_MAX_SEQUENCE_LENGTH),
             )
         )
+        self.stage2_scale_factor = int(
+            os.getenv("VIDEO_STAGE2_SCALE_FACTOR", str(DEFAULT_STAGE2_SCALE_FACTOR))
+        )
+        self.stage2_num_inference_steps = int(
+            os.getenv(
+                "VIDEO_STAGE2_INFERENCE_STEPS",
+                str(DEFAULT_STAGE2_NUM_INFERENCE_STEPS),
+            )
+        )
+        self.stage2_guidance_scale = float(
+            os.getenv(
+                "VIDEO_STAGE2_GUIDANCE_SCALE",
+                str(DEFAULT_STAGE2_GUIDANCE_SCALE),
+            )
+        )
+        self.default_prompt_suffix = os.getenv("VIDEO_PROMPT_SUFFIX", DEFAULT_PROMPT_SUFFIX)
+        self.default_realism_suffix = os.getenv("VIDEO_REALISM_SUFFIX", DEFAULT_REALISM_SUFFIX)
+        self.use_two_stage = _env_flag(
+            "VIDEO_ENABLE_TWO_STAGE",
+            self.pipeline_mode != PIPELINE_MODE_SINGLE_STAGE,
+        )
+        if self.pipeline_mode == PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            default_stage1_steps = DEFAULT_DEV_NUM_INFERENCE_STEPS
+            default_stage1_guidance = DEFAULT_DEV_GUIDANCE_SCALE
+        else:
+            default_stage1_steps = DEFAULT_DISTILLED_NUM_INFERENCE_STEPS
+            default_stage1_guidance = DEFAULT_DISTILLED_GUIDANCE_SCALE
+        self.default_num_inference_steps = int(
+            os.getenv("VIDEO_INFERENCE_STEPS", str(default_stage1_steps))
+        )
+        self.default_guidance_scale = float(
+            os.getenv("VIDEO_GUIDANCE_SCALE", str(default_stage1_guidance))
+        )
+        self.seed = os.getenv("VIDEO_SEED")
         self._lock = Lock()
 
         try:
-            from diffusers import LTX2ImageToVideoPipeline
+            from diffusers import (
+                FlowMatchEulerDiscreteScheduler,
+                LTX2ImageToVideoPipeline,
+                LTX2LatentUpsamplePipeline,
+            )
+            from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+            from diffusers.pipelines.ltx2.utils import (
+                DISTILLED_SIGMA_VALUES,
+                STAGE_2_DISTILLED_SIGMA_VALUES,
+            )
         except ImportError as exc:
             raise RuntimeError(
-                "Video generation requires a diffusers build with LTX-2 support. "
-                "Upgrade diffusers, transformers, accelerate, and huggingface_hub in the runtime image."
+                "Video generation requires a recent diffusers runtime with LTX-2 support."
             ) from exc
 
+        self._flow_match_scheduler_cls = FlowMatchEulerDiscreteScheduler
+        self._pipeline_cls = LTX2ImageToVideoPipeline
+        self._upsample_pipeline_cls = LTX2LatentUpsamplePipeline
+        self._latent_upsampler_cls = LTX2LatentUpsamplerModel
+        self._distilled_sigmas = DISTILLED_SIGMA_VALUES
+        self._stage2_sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
+        self._stage2_lora_loaded = False
+
         print(f"Initializing VideoGenerator on {self.device}...")
-        print(f"Loading LTX-2 image-to-video pipeline from {self.model_id}...")
+        print(
+            "Loading LTX-2 image-to-video pipeline "
+            f"mode={self.pipeline_mode} model_id={self.model_id}..."
+        )
 
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
         torch_dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
-        self.pipe = LTX2ImageToVideoPipeline.from_pretrained(
+        self.pipe = self._pipeline_cls.from_pretrained(
             self.model_id,
             torch_dtype=torch_dtype,
         )
+        self._default_scheduler_config = self.pipe.scheduler.config
+        self._prepare_pipeline_for_runtime(self.pipe, prefer_model_offload=False)
 
-        if self.device.startswith("cuda"):
-            if hasattr(self.pipe, "enable_attention_slicing"):
-                self.pipe.enable_attention_slicing("max")
-            if self.offload_mode == "model":
-                self.pipe.enable_model_cpu_offload()
-            else:
-                self.pipe.enable_sequential_cpu_offload(device=self.device)
-            self._cleanup_cuda_memory()
-        else:
-            self.pipe.to(self.device)
-
-        if hasattr(self.pipe, "vae") and hasattr(self.pipe.vae, "enable_tiling"):
-            self.pipe.vae.enable_tiling()
-        if hasattr(self.pipe, "enable_vae_slicing"):
-            self.pipe.enable_vae_slicing()
+        self.upsample_pipe = None
+        if self.use_two_stage:
+            print(
+                "Loading latent upsampler "
+                f"from {self.latent_upsampler_model_id}/latent_upsampler..."
+            )
+            latent_upsampler = self._latent_upsampler_cls.from_pretrained(
+                self.latent_upsampler_model_id,
+                subfolder="latent_upsampler",
+                torch_dtype=torch_dtype,
+            )
+            self.upsample_pipe = self._upsample_pipeline_cls(
+                vae=self.pipe.vae,
+                latent_upsampler=latent_upsampler,
+            )
+            self._prepare_pipeline_for_runtime(self.upsample_pipe, prefer_model_offload=True)
 
         print("VideoGenerator ready.")
+
+    def _prepare_pipeline_for_runtime(self, pipeline, *, prefer_model_offload: bool):
+        if self.device.startswith("cuda"):
+            if hasattr(pipeline, "enable_attention_slicing"):
+                pipeline.enable_attention_slicing("max")
+            if prefer_model_offload or self.offload_mode == "model":
+                pipeline.enable_model_cpu_offload(device=self.device)
+            else:
+                pipeline.enable_sequential_cpu_offload(device=self.device)
+            self._cleanup_cuda_memory()
+        else:
+            pipeline.to(self.device)
+
+        if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "enable_tiling"):
+            pipeline.vae.enable_tiling()
+        if hasattr(pipeline, "enable_vae_slicing"):
+            pipeline.enable_vae_slicing()
 
     def _cleanup_cuda_memory(self):
         if not torch.cuda.is_available():
@@ -104,7 +254,67 @@ class VideoGenerator:
             ) from exc
         return encode_video
 
-    def _run_pipe(
+    def _prepare_prompt(self, prompt: str) -> str:
+        prompt = " ".join(prompt.strip().split())
+        prompt_lower = prompt.lower()
+        is_stylized = any(marker in prompt_lower for marker in STYLIZED_PROMPT_MARKERS)
+        has_camera_language = any(marker in prompt_lower for marker in CAMERA_PROMPT_MARKERS)
+
+        prompt_parts = [prompt.rstrip(".")]
+
+        if len(prompt.split()) < 24:
+            prompt_parts.append(self.default_prompt_suffix)
+
+        if not has_camera_language:
+            prompt_parts.append(
+                "the camera movement is subtle and stable, keeping the main subject in clear focus"
+            )
+
+        if not is_stylized:
+            prompt_parts.append(self.default_realism_suffix)
+
+        return ". ".join(part for part in prompt_parts if part).strip() + "."
+
+    def _build_generator(self):
+        if self.seed is None:
+            return None
+        generator_device = self.device if self.device.startswith("cuda") else "cpu"
+        return torch.Generator(generator_device).manual_seed(int(self.seed))
+
+    def _restore_default_scheduler(self):
+        scheduler_cls = type(self.pipe.scheduler)
+        self.pipe.scheduler = scheduler_cls.from_config(self._default_scheduler_config)
+
+    def _enable_stage2_scheduler(self):
+        self.pipe.scheduler = self._flow_match_scheduler_cls.from_config(
+            self._default_scheduler_config,
+            use_dynamic_shifting=False,
+            shift_terminal=None,
+        )
+
+    def _ensure_stage2_lora_loaded(self):
+        if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE or self._stage2_lora_loaded:
+            return
+
+        print(
+            "Loading stage 2 distilled LoRA "
+            f"{self.stage2_lora_weight_name} from {self.stage2_lora_repo_id}..."
+        )
+        self.pipe.load_lora_weights(
+            self.stage2_lora_repo_id,
+            adapter_name="stage_2_distilled",
+            weight_name=self.stage2_lora_weight_name,
+        )
+        self._stage2_lora_loaded = True
+        self.pipe.set_adapters("stage_2_distilled", 0.0)
+
+    def _set_stage2_adapter_weight(self, weight: float):
+        if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            return
+        self._ensure_stage2_lora_loaded()
+        self.pipe.set_adapters("stage_2_distilled", weight)
+
+    def _run_single_stage(
         self,
         *,
         image: Any,
@@ -117,26 +327,121 @@ class VideoGenerator:
         guidance_scale: float,
         max_sequence_length: int,
     ):
-        return self.pipe(
-            image=image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            frame_rate=self.frame_rate,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            output_type="np",
+        prepared_prompt = self._prepare_prompt(prompt)
+        generator = self._build_generator()
+        call_kwargs = {
+            "image": image,
+            "prompt": prepared_prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": self.frame_rate,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "output_type": "np",
+            "return_dict": False,
+            "max_sequence_length": max_sequence_length,
+        }
+        if generator is not None:
+            call_kwargs["generator"] = generator
+        if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            call_kwargs["sigmas"] = self._distilled_sigmas
+        return self.pipe(**call_kwargs)
+
+    def _run_two_stage(
+        self,
+        *,
+        image: Any,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        num_frames: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        max_sequence_length: int,
+    ):
+        if self.upsample_pipe is None:
+            return self._run_single_stage(
+                image=image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                max_sequence_length=max_sequence_length,
+            )
+
+        prepared_prompt = self._prepare_prompt(prompt)
+        generator = self._build_generator()
+        self._restore_default_scheduler()
+        self._set_stage2_adapter_weight(0.0)
+
+        stage1_kwargs = {
+            "image": image,
+            "prompt": prepared_prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": self.frame_rate,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "output_type": "latent",
+            "return_dict": False,
+            "max_sequence_length": max_sequence_length,
+        }
+        if generator is not None:
+            stage1_kwargs["generator"] = generator
+        if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            stage1_kwargs["sigmas"] = self._distilled_sigmas
+
+        video_latent, audio_latent = self.pipe(**stage1_kwargs)
+
+        upscaled_video_latent = self.upsample_pipe(
+            latents=video_latent,
+            output_type="latent",
             return_dict=False,
-            max_sequence_length=max_sequence_length,
-        )
+        )[0]
+
+        stage2_width = width * self.stage2_scale_factor
+        stage2_height = height * self.stage2_scale_factor
+
+        if self.pipeline_mode == PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+            self._set_stage2_adapter_weight(1.0)
+            self._enable_stage2_scheduler()
+
+        stage2_kwargs = {
+            "image": image,
+            "latents": upscaled_video_latent,
+            "audio_latents": audio_latent,
+            "prompt": prepared_prompt,
+            "negative_prompt": negative_prompt,
+            "width": stage2_width,
+            "height": stage2_height,
+            "num_frames": num_frames,
+            "frame_rate": self.frame_rate,
+            "num_inference_steps": self.stage2_num_inference_steps,
+            "noise_scale": self._stage2_sigmas[0],
+            "sigmas": self._stage2_sigmas,
+            "guidance_scale": self.stage2_guidance_scale,
+            "output_type": "np",
+            "return_dict": False,
+            "max_sequence_length": max_sequence_length,
+        }
+        if generator is not None:
+            stage2_kwargs["generator"] = generator
+
+        return self.pipe(**stage2_kwargs)
 
     def generate_video(
         self,
         image: Any,
         prompt: str,
-        negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        negative_prompt: Optional[str] = DEFAULT_NEGATIVE_PROMPT,
         width: int = 768,
         height: int = 512,
         num_frames: int = 121,
@@ -147,6 +452,7 @@ class VideoGenerator:
         if (num_frames - 1) % 8 != 0:
             num_frames = ((num_frames - 1) // 8) * 8 + 1
 
+        negative_prompt = negative_prompt or DEFAULT_NEGATIVE_PROMPT
         num_inference_steps = num_inference_steps or self.default_num_inference_steps
         guidance_scale = (
             self.default_guidance_scale if guidance_scale is None else guidance_scale
@@ -154,25 +460,39 @@ class VideoGenerator:
 
         print(
             f"Generating video with {num_frames} frames, "
-            f"{num_inference_steps} steps, guidance {guidance_scale}..."
+            f"{num_inference_steps} stage-1 steps, guidance {guidance_scale}, "
+            f"mode={self.pipeline_mode}..."
         )
 
         try:
             with self._lock:
                 self._cleanup_cuda_memory()
                 with torch.inference_mode():
-                    video, audio = self._run_pipe(
-                        image=image,
-                        prompt=prompt,
-                        negative_prompt=negative_prompt,
-                        width=width,
-                        height=height,
-                        num_frames=num_frames,
-                        num_inference_steps=num_inference_steps,
-                        guidance_scale=guidance_scale,
-                        max_sequence_length=self.max_sequence_length,
-                    )
-        except torch.OutOfMemoryError as exc:
+                    if self.use_two_stage:
+                        video, audio = self._run_two_stage(
+                            image=image,
+                            prompt=prompt,
+                            negative_prompt=negative_prompt,
+                            width=width,
+                            height=height,
+                            num_frames=num_frames,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=guidance_scale,
+                            max_sequence_length=self.max_sequence_length,
+                        )
+                    else:
+                        video, audio = self._run_single_stage(
+                            image=image,
+                            prompt=prompt,
+                            negative_prompt=negative_prompt,
+                            width=width,
+                            height=height,
+                            num_frames=num_frames,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=guidance_scale,
+                            max_sequence_length=self.max_sequence_length,
+                        )
+        except torch.OutOfMemoryError:
             if not self.device.startswith("cuda"):
                 raise
 
@@ -190,7 +510,7 @@ class VideoGenerator:
             try:
                 with self._lock:
                     with torch.inference_mode():
-                        video, audio = self._run_pipe(
+                        video, audio = self._run_single_stage(
                             image=image,
                             prompt=prompt,
                             negative_prompt=negative_prompt,
@@ -232,6 +552,9 @@ class VideoGenerator:
             with open(temp_filepath, "rb") as file_obj:
                 return file_obj.read()
         finally:
+            if self.pipeline_mode == PIPELINE_MODE_DEV_LORA_TWO_STAGE:
+                self._set_stage2_adapter_weight(0.0)
+                self._restore_default_scheduler()
             self._cleanup_cuda_memory()
             if temp_filepath and os.path.exists(temp_filepath):
                 os.remove(temp_filepath)
