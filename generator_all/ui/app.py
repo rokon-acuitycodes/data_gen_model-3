@@ -102,6 +102,13 @@ def get_t5_model(device: str):
     return T5Model(device=device)
 
 
+@lru_cache(maxsize=2)
+def get_text_generator(device: str):
+    from generators.text_generator import TextGenerator
+
+    return TextGenerator(get_t5_model(device))
+
+
 @lru_cache(maxsize=1)
 def get_video_generator(device: str):
     from generators.video_generator import VideoGenerator
@@ -137,6 +144,8 @@ def files_to_zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
 
 
 def _content_type_for_ext(file_ext: str) -> str:
+    if file_ext == "txt":
+        return "text/plain;charset=utf-8"
     if file_ext == "csv":
         return "text/csv"
     if file_ext == "xlsx":
@@ -438,6 +447,107 @@ async def generate_data_from_file(
             "files": file_summaries,
             "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
             "file_results": file_items,
+        }
+    )
+
+
+@app.post("/api/generate/text-from-file")
+async def generate_text_from_file(
+    file: UploadFile = File(...),
+    num_outputs: int = Form(3),
+    max_length: int = Form(200),
+    mode: Literal["json", "zip"] = Query("json", description="Return JSON metadata or the ZIP bytes."),
+):
+    file_ext = _get_file_ext(file.filename or "")
+    if file_ext not in {"txt", "csv", "xlsx", "docx", "pdf"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format. Use txt/csv/xlsx/docx/pdf.",
+        )
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    device = _device()
+    named_file = NamedBytesIO(contents, name=file.filename or "upload")
+
+    text_gen = get_text_generator(device)
+    text_files = text_gen.generate(
+        named_file,
+        num_files=num_outputs,
+        file_ext=file_ext,
+        max_length=max_length,
+    )
+
+    if not text_files:
+        raise HTTPException(status_code=500, detail="Text generation produced no output.")
+
+    zip_bytes = files_to_zip_bytes(text_files)
+
+    s3_manager = get_s3_manager()
+    zip_stem = Path(file.filename).stem if file.filename else "uploaded_file"
+    download_url = None
+    text_items: List[Dict[str, Any]] = []
+
+    if s3_manager:
+        files_for_s3 = [
+            (filename, data, _content_type_for_ext("txt"))
+            for filename, data in text_files
+        ]
+        download_url = s3_manager.upload_and_zip(
+            files=files_for_s3,
+            zip_name=f"generated_text_{zip_stem}",
+        )
+
+        for filename, data in text_files:
+            file_url = s3_manager.upload_file(
+                file_data=data,
+                filename=filename,
+                content_type=_content_type_for_ext("txt"),
+            )
+            text_items.append(
+                {
+                    "filename": filename,
+                    "text": data.decode("utf-8"),
+                    "file_url": file_url,
+                }
+            )
+    else:
+        for filename, data in text_files:
+            b64 = base64.b64encode(data).decode("utf-8")
+            text_items.append(
+                {
+                    "filename": filename,
+                    "text": data.decode("utf-8"),
+                    "text_base64": b64,
+                    "file_url": make_data_uri(_content_type_for_ext("txt"), b64),
+                }
+            )
+
+    if mode == "zip":
+        return StreamingResponse(
+            io.BytesIO(zip_bytes),
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="generated_text.zip"'},
+        )
+
+    if download_url:
+        return {
+            "mode": "json",
+            "file_type": file_ext,
+            "texts_count": len(text_files),
+            "zip_download_url": download_url,
+            "text_results": text_items,
+        }
+
+    return JSONResponse(
+        {
+            "mode": "json",
+            "file_type": file_ext,
+            "texts_count": len(text_files),
+            "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
+            "text_results": text_items,
         }
     )
 

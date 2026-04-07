@@ -1,12 +1,20 @@
 import torch
 from diffusers import AutoPipelineForText2Image
 
+
+def _load_public_pipeline(model_name, **kwargs):
+    load_kwargs = dict(kwargs)
+    try:
+        return AutoPipelineForText2Image.from_pretrained(model_name, token=False, **load_kwargs)
+    except TypeError:
+        return AutoPipelineForText2Image.from_pretrained(model_name, use_auth_token=False, **load_kwargs)
+
 class ImageGenerator:
     """Generates images from prompts using SDXL Turbo."""
     def __init__(self, device):
         self.device = device
         print("⏳ Loading Stable Diffusion 1.5 with CPU Offload strategy...")
-        self.pipe = AutoPipelineForText2Image.from_pretrained(
+        self.pipe = _load_public_pipeline(
             "runwayml/stable-diffusion-v1-5",
             torch_dtype=torch.float16,
             variant="fp16",

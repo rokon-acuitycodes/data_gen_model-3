@@ -4,6 +4,7 @@ This project provides a FastAPI backend for generating:
 
 - Image variants from an uploaded image
 - Synthetic data files from uploaded CSV/XLSX/DOCX/PDF
+- Plain-text outputs from uploaded TXT/CSV/XLSX/DOCX/PDF files
 - Image from text prompt
 
 It replaces the previous Streamlit UI flow and exposes API endpoints with OpenAPI/Swagger for testing.
@@ -180,6 +181,32 @@ Form fields:
 }
 ```
 
+## 5) `POST /api/generate/text-from-file`
+
+Form fields:
+
+- `file` (`txt|csv|xlsx|docx|pdf`)
+- `num_outputs` (int, default `3`)
+- `max_length` (int, default `200`)
+- query `mode=json|zip` (default `json`)
+
+`mode=json` response:
+
+```json
+{
+  "mode": "json",
+  "file_type": "pdf",
+  "texts_count": 3,
+  "text_results": [
+    {
+      "filename": "generated_text_1_input.txt",
+      "text": "Rewritten plain-text output...",
+      "file_url": "https://.../generated_text_1_input.txt"
+    }
+  ]
+}
+```
+
 ## Response Mode Rules
 
 - `mode=zip` returns binary ZIP stream (`application/zip`)
@@ -190,6 +217,7 @@ Form fields:
 - Large model initialization can take time on first run.
 - For consistent API behavior in production, prefer setting valid S3 credentials.
 - Caption generation uses OpenAI; custom caption avoids that API call.
+- File-to-text generation uses `google/flan-t5-small` through the shared `T5Model` wrapper.
 
 ## Troubleshooting
 
@@ -199,4 +227,3 @@ Form fields:
   - Ensure Uvicorn binds to `0.0.0.0:8000`.
 - Missing Swagger:
   - Use `/docs` path on the correct base URL.
-
