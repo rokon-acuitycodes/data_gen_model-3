@@ -1,4 +1,5 @@
 import gc
+import inspect
 import math
 import os
 import tempfile
@@ -427,8 +428,8 @@ class VideoGenerator:
         prepared_prompt = self._prepare_prompt(prompt)
         generator = self._build_generator()
         audio_pipe = self._get_audio_pipe()
+        audio_pipe_params = inspect.signature(audio_pipe.__call__).parameters
         call_kwargs = {
-            "image": image,
             "audio": audio_path,
             "prompt": prepared_prompt,
             "negative_prompt": negative_prompt,
@@ -442,6 +443,23 @@ class VideoGenerator:
             "return_dict": False,
             "max_sequence_length": max_sequence_length,
         }
+        if "image" in audio_pipe_params:
+            call_kwargs["image"] = image
+        elif "conditions" in audio_pipe_params:
+            try:
+                from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Audio-conditioned generation requires LTX2VideoCondition support in diffusers."
+                ) from exc
+
+            call_kwargs["conditions"] = [LTX2VideoCondition(frames=image, index=0, strength=1.0)]
+        else:
+            raise RuntimeError(
+                "The loaded audio-conditioned LTX-2 pipeline does not support either `image` or "
+                "`conditions` inputs."
+            )
+
         if generator is not None:
             call_kwargs["generator"] = generator
         if self.pipeline_mode != PIPELINE_MODE_DEV_LORA_TWO_STAGE:
