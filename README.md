@@ -3,6 +3,7 @@
 This project provides a FastAPI backend for generating:
 
 - Image variants from an uploaded image
+- Image-to-image editing from an uploaded reference image
 - Synthetic data files from uploaded CSV/XLSX/DOCX/PDF
 - Plain-text outputs from uploaded TXT/CSV/XLSX/DOCX/PDF files
 - Image from text prompt
@@ -44,12 +45,14 @@ Main dependencies include:
 Set these as needed:
 
 - `OPENAI_API_KEY` (required for auto image captioning)
+- `HF_TOKEN` (optional; only needed when you explicitly enable auth for gated/private Hugging Face models)
 - `AWS_ACCESS_KEY_ID` (optional, for S3)
 - `AWS_SECRET_ACCESS_KEY` (optional, for S3)
 - `S3_BUCKET_NAME` (optional, for S3)
 - `AWS_REGION` (optional, default `us-east-2`)
 
 If S3 variables are not set/valid, API still works using base64 response fallback.
+The default image model is `black-forest-labs/FLUX.2-klein-4B`, which is public and does not require Hugging Face license acceptance. `serve_modal_new.py` disables Hugging Face auth for image downloads by default so an expired cached token does not break public model fetches.
 
 ## Run Locally
 
@@ -87,6 +90,8 @@ After deploy, use the generated Modal URL:
 
 - Swagger UI: `<your-modal-url>/docs`
 - OpenAPI JSON: `<your-modal-url>/openapi.json`
+
+`serve_modal_new.py` is configured for `black-forest-labs/FLUX.2-klein-4B` on an `L4` worker so the image model can be downloaded from Hugging Face into the Modal cache volume and run with lower latency and lower cost.
 
 ## API Endpoints
 
@@ -181,6 +186,11 @@ Form fields:
 }
 ```
 
+Notes:
+
+- The active text-to-image backend is `black-forest-labs/FLUX.2-klein-4B`.
+- Modal defaults use the official 4-step FLUX.2 klein recipe for faster generation.
+
 ## 5) `POST /api/generate/text-from-file`
 
 Form fields:
@@ -206,6 +216,40 @@ Form fields:
   ]
 }
 ```
+
+## 6) `POST /api/generate/image-to-image`
+
+Form fields:
+
+- `file` (`jpg|jpeg|png`)
+- `prompt` (required)
+- `num_outputs` (int, default `1`, max `4`)
+- `num_inference_steps` (optional)
+- `guidance_scale` (optional)
+- `seed` (optional)
+- query `mode=json|zip` (default `json`)
+
+`mode=json` response:
+
+```json
+{
+  "mode": "json",
+  "prompt": "turn this product shot into a premium studio ad",
+  "images_count": 1,
+  "zip_download_url": "https://.../image_to_image_bundle.zip",
+  "image_results": [
+    {
+      "image_index": 1,
+      "file_url": "https://.../image_to_image_1.png"
+    }
+  ]
+}
+```
+
+Notes:
+
+- This endpoint uses the uploaded image as FLUX.2 klein 4B conditioning input.
+- The uploaded image is resized to a non-stretched 1024x1024 canvas before generation.
 
 ## Response Mode Rules
 

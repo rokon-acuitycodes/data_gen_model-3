@@ -192,6 +192,36 @@ def prepare_video_condition_image(image: Any, target_width: int = 768, target_he
     return canvas
 
 
+def prepare_image_edit_input(image: Any, target_width: int = 1024, target_height: int = 1024):
+    """Resize without stretching, preserving the reference image on a soft background canvas."""
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    background = ImageOps.fit(
+        image,
+        (target_width, target_height),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    background = background.filter(ImageFilter.GaussianBlur(radius=22))
+    background = ImageEnhance.Brightness(background).enhance(0.8)
+
+    foreground = ImageOps.contain(
+        image,
+        (target_width, target_height),
+        method=Image.Resampling.LANCZOS,
+    )
+
+    canvas = background.copy()
+    offset = (
+        (target_width - foreground.width) // 2,
+        (target_height - foreground.height) // 2,
+    )
+    canvas.paste(foreground, offset)
+    return canvas
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "device": _device()}
@@ -246,10 +276,13 @@ async def generate_image_from_file(
                 variations = variations[:num_files]
 
     # 2) Image generation
-    with torch.no_grad():
-        img_gen = get_image_generator(device)
-        num_images_to_generate = min(num_files, len(variations))
-        generated_images = img_gen.generate_images(variations[:num_images_to_generate])
+    try:
+        with torch.no_grad():
+            img_gen = get_image_generator(device)
+            num_images_to_generate = min(num_files, len(variations))
+            generated_images = img_gen.generate_images(variations[:num_images_to_generate])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     # 3) Zip output (always prepared; we may upload to S3 for URL mode)
     zip_bytes = images_to_zip_bytes(generated_images)
@@ -561,17 +594,20 @@ async def generate_image_from_text(
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required.")
 
-    # Stable Diffusion max tokenization is sensitive; keep the previous guardrail.
-    if len(prompt) > 100:
-        prompt = prompt[:100]
+    prompt_char_limit = int(os.getenv("IMAGE_PROMPT_CHAR_LIMIT", "1200"))
+    if len(prompt) > prompt_char_limit:
+        prompt = prompt[:prompt_char_limit]
 
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with torch.no_grad():
-        img_gen = get_image_generator(device)
-        generated_images = img_gen.generate_images([prompt])
+    try:
+        with torch.no_grad():
+            img_gen = get_image_generator(device)
+            generated_images = img_gen.generate_images([prompt])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     if not generated_images:
         raise HTTPException(status_code=500, detail="Failed to generate image.")
@@ -602,6 +638,132 @@ async def generate_image_from_text(
             "prompt": prompt,
             "images_count": 1,
             "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
+        }
+    )
+
+
+@app.post("/api/generate/image-to-image")
+async def generate_image_to_image(
+    file: UploadFile = File(...),
+    prompt: str = Form(..., description="Prompt describing the image edit or variation."),
+    num_outputs: int = Form(1, description="How many edited images to generate."),
+    num_inference_steps: Optional[int] = Form(None, description="Override the default FLUX inference steps."),
+    guidance_scale: Optional[float] = Form(None, description="Override the default FLUX guidance scale."),
+    seed: Optional[int] = Form(None, description="Optional base seed for reproducible outputs."),
+    mode: Literal["json", "zip"] = Query("json", description="Return JSON metadata or the ZIP bytes."),
+):
+    file_ext = _get_file_ext(file.filename or "")
+    if file_ext not in {"jpg", "jpeg", "png"}:
+        raise HTTPException(status_code=400, detail="Unsupported image format. Use jpg/jpeg/png.")
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+
+    if num_outputs < 1:
+        raise HTTPException(status_code=400, detail="num_outputs must be at least 1.")
+
+    max_outputs = int(os.getenv("IMAGE_TO_IMAGE_MAX_OUTPUTS", "4"))
+    if num_outputs > max_outputs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"num_outputs must be less than or equal to {max_outputs}.",
+        )
+
+    prompt_char_limit = int(os.getenv("IMAGE_PROMPT_CHAR_LIMIT", "1200"))
+    if len(prompt) > prompt_char_limit:
+        prompt = prompt[:prompt_char_limit]
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    from PIL import Image
+    import torch
+
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    image = prepare_image_edit_input(image)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    try:
+        with torch.no_grad():
+            img_gen = get_image_generator(device)
+            generated_images = img_gen.generate_images_from_image(
+                image,
+                prompt,
+                num_outputs=num_outputs,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+            )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if not generated_images:
+        raise HTTPException(status_code=500, detail="Failed to generate image-to-image output.")
+
+    zip_bytes = images_to_zip_bytes(generated_images)
+
+    s3_manager = get_s3_manager()
+    zip_stem = Path(file.filename).stem if file.filename else "uploaded_image"
+    download_url = None
+    image_items: List[Dict[str, Any]] = []
+
+    if s3_manager:
+        image_files = [(f"image_to_image_{i+1}.png", img) for i, img in enumerate(generated_images)]
+        download_url = s3_manager.upload_images_and_zip(
+            images=image_files,
+            zip_name=f"image_to_image_{zip_stem}",
+        )
+
+        for i, img in enumerate(generated_images):
+            png_bytes = pil_image_to_png_bytes(img)
+            image_url = s3_manager.upload_file(
+                file_data=png_bytes,
+                filename=f"image_to_image_{i+1}.png",
+                content_type="image/png",
+            )
+            image_items.append(
+                {
+                    "image_index": i + 1,
+                    "file_url": image_url,
+                }
+            )
+    else:
+        for i, img in enumerate(generated_images):
+            png_bytes = pil_image_to_png_bytes(img)
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+            image_items.append(
+                {
+                    "image_index": i + 1,
+                    "image_base64": b64,
+                    "file_url": make_data_uri("image/png", b64),
+                }
+            )
+
+    if mode == "zip":
+        return StreamingResponse(
+            io.BytesIO(zip_bytes),
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="image_to_image.zip"'},
+        )
+
+    if download_url:
+        return {
+            "mode": "json",
+            "prompt": prompt,
+            "images_count": len(generated_images),
+            "zip_download_url": download_url,
+            "image_results": image_items,
+        }
+
+    return JSONResponse(
+        {
+            "mode": "json",
+            "prompt": prompt,
+            "images_count": len(generated_images),
+            "zip_base64": base64.b64encode(zip_bytes).decode("utf-8"),
+            "image_results": image_items,
         }
     )
 
