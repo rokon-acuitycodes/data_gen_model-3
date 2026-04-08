@@ -835,6 +835,11 @@ async def generate_video_from_image(
                 detail=error_message,
             ) from exc
         raise
+    except TypeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The audio-conditioned video pipeline is incompatible with the current runtime.",
+        ) from exc
 
     if not video_bytes:
         raise HTTPException(status_code=500, detail="Failed to generate video.")

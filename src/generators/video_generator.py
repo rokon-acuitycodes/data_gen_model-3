@@ -4,6 +4,7 @@ import math
 import os
 import tempfile
 from threading import Lock
+from types import MethodType
 from typing import Any, Optional
 
 import torch
@@ -243,6 +244,23 @@ class VideoGenerator:
         if hasattr(pipeline, "enable_vae_slicing"):
             pipeline.enable_vae_slicing()
 
+    def _patch_audio_pipeline_compatibility(self, pipeline):
+        connectors = getattr(pipeline, "connectors", None)
+        if connectors is None:
+            return
+
+        forward_signature = inspect.signature(connectors.forward)
+        if "additive_mask" in forward_signature.parameters:
+            return
+
+        original_forward = connectors.forward
+
+        def wrapped_forward(self, *args, additive_mask=None, **kwargs):
+            del additive_mask
+            return original_forward(*args, **kwargs)
+
+        connectors.forward = MethodType(wrapped_forward, connectors)
+
     def _get_audio_pipe(self):
         if self._audio_pipe is not None:
             return self._audio_pipe
@@ -265,6 +283,7 @@ class VideoGenerator:
             custom_pipeline=self.audio_custom_pipeline,
             torch_dtype=torch_dtype,
         )
+        self._patch_audio_pipeline_compatibility(self._audio_pipe)
         self._prepare_pipeline_for_runtime(self._audio_pipe, prefer_model_offload=False)
         return self._audio_pipe
 
