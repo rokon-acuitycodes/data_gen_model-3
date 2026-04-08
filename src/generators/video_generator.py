@@ -287,6 +287,41 @@ class VideoGenerator:
         self._prepare_pipeline_for_runtime(self._audio_pipe, prefer_model_offload=False)
         return self._audio_pipe
 
+    def _infer_condition_mode(self, frames: Any) -> str:
+        if isinstance(frames, (list, tuple)):
+            return "video"
+        if isinstance(frames, torch.Tensor) and frames.ndim >= 4:
+            return "video"
+        return "image"
+
+    def _build_video_condition(self, pipeline, *, frames: Any, index: int, strength: float):
+        pipeline_module = inspect.getmodule(pipeline.__class__)
+        condition_cls = getattr(pipeline_module, "LTX2VideoCondition", None) if pipeline_module else None
+
+        if condition_cls is None:
+            try:
+                from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition as condition_cls
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Audio-conditioned generation requires LTX2VideoCondition support in diffusers."
+                ) from exc
+
+        condition_mode = self._infer_condition_mode(frames)
+        init_signature = inspect.signature(condition_cls)
+        init_kwargs = {
+            "frames": frames,
+            "index": index,
+            "strength": strength,
+        }
+        if "mode" in init_signature.parameters:
+            init_kwargs["mode"] = condition_mode
+
+        condition = condition_cls(**init_kwargs)
+        if not hasattr(condition, "mode"):
+            condition.mode = condition_mode
+
+        return condition
+
     def _cleanup_cuda_memory(self):
         if not torch.cuda.is_available():
             return
@@ -465,14 +500,14 @@ class VideoGenerator:
         if "image" in audio_pipe_params:
             call_kwargs["image"] = image
         elif "conditions" in audio_pipe_params:
-            try:
-                from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Audio-conditioned generation requires LTX2VideoCondition support in diffusers."
-                ) from exc
-
-            call_kwargs["conditions"] = [LTX2VideoCondition(frames=image, index=0, strength=1.0)]
+            call_kwargs["conditions"] = [
+                self._build_video_condition(
+                    audio_pipe,
+                    frames=image,
+                    index=0,
+                    strength=1.0,
+                )
+            ]
         else:
             raise RuntimeError(
                 "The loaded audio-conditioned LTX-2 pipeline does not support either `image` or "
