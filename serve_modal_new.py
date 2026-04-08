@@ -9,7 +9,7 @@ vol = modal.Volume.from_name("unified-gen-volume", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "libgl1", "libglib2.0-0")
+    .apt_install("git", "libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
         "fastapi>=0.110.0",
         "uvicorn[standard]>=0.27.0",

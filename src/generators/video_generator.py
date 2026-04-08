@@ -7,6 +7,7 @@ from threading import Lock
 from types import MethodType
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 
@@ -28,6 +29,7 @@ DEFAULT_STAGE2_GUIDANCE_SCALE = 1.0
 DEFAULT_STAGE2_SCALE_FACTOR = 2
 DEFAULT_STAGE2_LORA_WEIGHT_NAME = "ltx-2-19b-distilled-lora-384.safetensors"
 DEFAULT_AUDIO_CUSTOM_PIPELINE = "linoyts/ltx2-audio-video-conditioning"
+DEFAULT_AUDIO_SAMPLING_RATE = 16000
 DEFAULT_MAX_SEQUENCE_LENGTH = 256
 DEFAULT_OFFLOAD_MODE = "sequential"
 DEFAULT_OOM_RETRY_MAX_SEQUENCE_LENGTH = 128
@@ -322,6 +324,78 @@ class VideoGenerator:
 
         return condition
 
+    def _ensure_audio_runtime_dependencies(self):
+        try:
+            import av  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Audio-conditioned video generation requires the `av` package in the runtime "
+                "image. Add `av` to the Modal image and redeploy."
+            ) from exc
+
+    def _decode_audio_to_waveform(
+        self,
+        audio_path: str,
+        *,
+        target_sample_rate: int,
+    ) -> torch.Tensor:
+        self._ensure_audio_runtime_dependencies()
+
+        try:
+            import av
+        except ImportError as exc:
+            raise RuntimeError(
+                "Audio-conditioned video generation requires the `av` package in the runtime "
+                "image. Add `av` to the Modal image and redeploy."
+            ) from exc
+
+        resampler = av.audio.resampler.AudioResampler(
+            format="fltp",
+            layout="stereo",
+            rate=target_sample_rate,
+        )
+        decoded_chunks = []
+
+        def _append_resampled_frames(frames: Any) -> None:
+            if frames is None:
+                return
+            if not isinstance(frames, (list, tuple)):
+                frames = [frames]
+            for resampled_frame in frames:
+                chunk = resampled_frame.to_ndarray()
+                if chunk.ndim == 1:
+                    chunk = np.expand_dims(chunk, axis=0)
+                decoded_chunks.append(chunk.astype(np.float32, copy=False))
+
+        try:
+            with av.open(audio_path) as container:
+                audio_stream = next(
+                    (stream for stream in container.streams if stream.type == "audio"),
+                    None,
+                )
+                if audio_stream is None:
+                    raise RuntimeError("The uploaded file does not contain an audio stream.")
+
+                for frame in container.decode(audio_stream):
+                    _append_resampled_frames(resampler.resample(frame))
+
+                try:
+                    _append_resampled_frames(resampler.resample(None))
+                except TypeError:
+                    pass
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to decode the uploaded audio file for audio-conditioned video generation."
+            ) from exc
+
+        if not decoded_chunks:
+            raise RuntimeError("The uploaded audio file could not be decoded into waveform samples.")
+
+        waveform = np.concatenate(decoded_chunks, axis=1)
+        return torch.from_numpy(np.ascontiguousarray(waveform))
+
     def _cleanup_cuda_memory(self):
         if not torch.cuda.is_available():
             return
@@ -482,9 +556,15 @@ class VideoGenerator:
         prepared_prompt = self._prepare_prompt(prompt)
         generator = self._build_generator()
         audio_pipe = self._get_audio_pipe()
+        audio_input = self._decode_audio_to_waveform(
+            audio_path,
+            target_sample_rate=int(
+                getattr(audio_pipe, "audio_sampling_rate", DEFAULT_AUDIO_SAMPLING_RATE)
+            ),
+        )
         audio_pipe_params = inspect.signature(audio_pipe.__call__).parameters
         call_kwargs = {
-            "audio": audio_path,
+            "audio": audio_input,
             "prompt": prepared_prompt,
             "negative_prompt": negative_prompt,
             "width": width,

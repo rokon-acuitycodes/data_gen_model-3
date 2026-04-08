@@ -37,6 +37,7 @@ Main dependencies include:
 
 - `fastapi`, `uvicorn[standard]`, `python-multipart`
 - `torch`, `transformers`, `diffusers`, `accelerate`
+- `torchaudio`, `torchcodec`
 - `pandas`, `openpyxl`, `python-docx`, `pypdf`, `reportlab`
 - `boto3`, `openai`, `python-dotenv`
 
@@ -264,6 +265,7 @@ Notes:
 - `sync_to_audio_duration` (default `true`)
 
 When `audio_file` is provided, the video generator switches to an audio-conditioned LTX-2 pipeline for lip-sync and attempts to match the clip length to the audio duration.
+This runtime path also requires `torchcodec` and FFmpeg because current `torchaudio.load(...)` uses TorchCodec-backed decoding in the deployed image.
 
 ## Common Notes
 

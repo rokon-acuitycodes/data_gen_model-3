@@ -829,18 +829,26 @@ async def generate_video_from_image(
         ) from exc
     except RuntimeError as exc:
         error_message = str(exc)
+        print(f"Video generation runtime error: {error_message}")
         if "out of GPU memory" in error_message or "out of memory" in error_message:
+            raise HTTPException(
+                status_code=503,
+                detail=error_message,
+            ) from exc
+        if "torchcodec" in error_message.lower() or "audio-conditioned" in error_message.lower():
             raise HTTPException(
                 status_code=503,
                 detail=error_message,
             ) from exc
         raise
     except TypeError as exc:
+        print(f"Video generation type error: {exc}")
         raise HTTPException(
             status_code=503,
             detail="The audio-conditioned video pipeline is incompatible with the current runtime.",
         ) from exc
     except AttributeError as exc:
+        print(f"Video generation attribute error: {exc}")
         raise HTTPException(
             status_code=503,
             detail="The audio-conditioned video pipeline is incompatible with the current runtime.",
